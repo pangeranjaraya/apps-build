@@ -1,0 +1,268 @@
+name: Flutter APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Build tag"
+        required: true
+        type: string
+
+      release_tag:
+        description: "GitHub Release tag containing Flutter ZIP"
+        required: true
+        type: string
+
+      build_type:
+        description: "Build type"
+        required: true
+        type: choice
+        options:
+          - debug
+          - release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Flutter APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+
+      # =========================================================
+      # 1. INFORMASI BUILD
+      # =========================================================
+      - name: Show Build Information
+        run: |
+          echo "======================================"
+          echo "      LI BING BING BUILD APPS FREE"
+          echo "======================================"
+          echo "Repository : $GITHUB_REPOSITORY"
+          echo "Build Tag  : ${{ inputs.tag }}"
+          echo "Release    : ${{ inputs.release_tag }}"
+          echo "Build Type : ${{ inputs.build_type }}"
+          echo "======================================"
+
+      # =========================================================
+      # 2. DOWNLOAD ZIP DARI GITHUB RELEASE
+      # =========================================================
+      - name: Download Flutter Project From Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -e
+
+          mkdir -p /tmp/flutter_build
+          mkdir -p /tmp/flutter_build/project
+
+          echo "🔎 Mencari GitHub Release..."
+
+          RELEASE_JSON=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")
+
+          echo "✅ Release ditemukan."
+
+          echo "$RELEASE_JSON" > /tmp/release.json
+
+          ASSET_URL=$(python3 - <<'PY'
+          import json
+
+          with open("/tmp/release.json", "r") as f:
+              data = json.load(f)
+
+          assets = data.get("assets", [])
+
+          zips = [
+              x for x in assets
+              if x.get("name", "").lower().endswith(".zip")
+          ]
+
+          if not zips:
+              raise SystemExit("Tidak ditemukan asset ZIP pada Release.")
+
+          print(zips[0]["url"])
+          PY
+          )
+
+          echo "📦 ZIP ditemukan."
+
+          curl -fsSL \
+            -L \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$ASSET_URL" \
+            -o /tmp/flutter_build/project.zip
+
+          test -s /tmp/flutter_build/project.zip
+
+          echo "✅ ZIP berhasil didownload."
+
+      # =========================================================
+      # 3. EXTRACT PROJECT
+      # =========================================================
+      - name: Extract Flutter Project
+        run: |
+          set -e
+
+          unzip -q \
+            /tmp/flutter_build/project.zip \
+            -d /tmp/flutter_build/project
+
+          echo "📂 Isi project:"
+          find /tmp/flutter_build/project -maxdepth 3 -type f | head -100
+
+      # =========================================================
+      # 4. CARI pubspec.yaml
+      # =========================================================
+      - name: Locate Flutter Project
+        run: |
+          set -e
+
+          if [ -f "/tmp/flutter_build/project/pubspec.yaml" ]; then
+
+            PROJECT_DIR="/tmp/flutter_build/project"
+
+          else
+
+            PROJECT_DIR=$(find \
+              /tmp/flutter_build/project \
+              -name pubspec.yaml \
+              -type f \
+              -print -quit \
+              | xargs -r dirname)
+
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "❌ pubspec.yaml tidak ditemukan."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "✅ Flutter project:"
+          echo "$PROJECT_DIR"
+
+      # =========================================================
+      # 5. JAVA
+      # =========================================================
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # =========================================================
+      # 6. FLUTTER
+      # =========================================================
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # =========================================================
+      # 7. CEK VERSI
+      # =========================================================
+      - name: Flutter Doctor
+        run: |
+          flutter --version
+          flutter doctor -v
+
+      # =========================================================
+      # 8. INSTALL DEPENDENCIES
+      # =========================================================
+      - name: Install Dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+
+          flutter pub get
+
+      # =========================================================
+      # 9. CLEAN
+      # =========================================================
+      - name: Flutter Clean
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean
+          flutter pub get
+
+      # =========================================================
+      # 10. BUILD DEBUG / RELEASE
+      # =========================================================
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+
+            echo "🐞 BUILD DEBUG"
+            flutter build apk --debug
+
+          else
+
+            echo "🚀 BUILD RELEASE"
+            flutter build apk --release
+
+          fi
+
+      # =========================================================
+      # 11. CEK HASIL APK
+      # =========================================================
+      - name: Find APK
+        run: |
+          set -e
+
+          echo "📦 APK yang dihasilkan:"
+
+          find "$PROJECT_DIR/build/app/outputs/flutter-apk" \
+            -type f \
+            -name "*.apk" \
+            -print
+
+          APK_COUNT=$(find \
+            "$PROJECT_DIR/build/app/outputs/flutter-apk" \
+            -type f \
+            -name "*.apk" \
+            | wc -l)
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "❌ APK tidak ditemukan."
+            exit 1
+          fi
+
+          echo "✅ APK ditemukan."
+
+      # =========================================================
+      # 12. UPLOAD APK SEBAGAI ARTIFACT
+      # =========================================================
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-apk-${{ inputs.build_type }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # =========================================================
+      # 13. SELESAI
+      # =========================================================
+      - name: Build Completed
+        run: |
+          echo "======================================"
+          echo "✅ BUILD SELESAI"
+          echo "======================================"
+          echo "Mode : ${{ inputs.build_type }}"
+          echo "Tag  : ${{ inputs.release_tag }}"
+          echo "APK  : Artifact flutter-apk-${{ inputs.build_type }}"
+          echo "======================================"
